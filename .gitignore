@@ -1,0 +1,33 @@
+# ---------- 密钥：绝不入库 ----------
+.env
+.env.*
+!.env.example
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---------- 工程噪音 ----------
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+
+# ---------- 运行期产物（可由 scripts/ 重建，入库只会拖垮仓库） ----------
+index/
+*.lock
+
+# ---------- 语料：297MB 公开财报 PDF，不入库 ----------
+# 来源为巨潮资讯网公开披露文件，且单文件逼近 GitHub 100MB 上限；
+# 需要时用 scripts/crawl_reports.py + scripts/ingest_corpus.py 重建。
+data/reports/
+data/**/*.pdf
+
+# ---------- 本地工程/调试产物 ----------
+.codebuddy/
+.playwright-cli/
+generated-images/
+*.log
+node_modules/

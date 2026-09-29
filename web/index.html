@@ -1,0 +1,1155 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>value_compass · 知识星河</title>
+<!--
+  web 主前端（阶段 2）：星河视觉 + 知识星图 + 三栏排版 + 问答卡片。
+  数据全部来自后端契约，前端**不自算任何星图状态**：
+    GET  /starmap?thread_id=  → {groups, session_nodes, seed_nodes, unlocked_nodes,
+                                  clickable, tiers, session_edges, rule_edges}
+    POST /ask                 → {answer, ui_payload, ...}
+  亮度档位/可点亮集合由服务端下发：两边各算一遍必然漂移，用户会看到"点了没反应"的节点。
+  渲染用 canvas 2D 而非 three.js：37 节点是拓扑图不是粒子系统，2D 命中检测简单可靠，
+  且零外部依赖（three.js 的 importmap 依赖 CDN，内网/离线即挂）。
+-->
+<style>
+  :root{
+    --bg:#05080F; --panel:rgba(13,18,28,.86); --panel2:rgba(22,30,45,.72);
+    --line:rgba(90,120,170,.22); --text:#E8EDF5; --muted:#8C9AB3;
+    --blue:#4C8DFF; --gold:#E8B23A; --green:#3FBF7F; --red:#E5544B; --cyan:#57D4E0;
+  }
+  *{box-sizing:border-box; margin:0;}
+  html,body{height:100%; overflow:hidden; color:var(--text);
+    font:14px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+    background:radial-gradient(1400px 700px at 20% -10%, #0D1526 0%, var(--bg) 60%);}
+  button{font:inherit; color:inherit; cursor:pointer; border:none; background:none;}
+  [hidden]{display:none !important;}
+
+  /* canvas 是 replaced element：inset:0 不会拉伸它，它按 width/height 属性的固有尺寸显示。
+     不显式给 100% 的话，Retina(dpr=2) 下画布会以 2 倍视口的尺寸显示 —— 画面被整体放大，
+     节点看着在一处、命中区在另一处，悬停和点击全部失灵。 */
+  #sky{position:fixed; inset:0; width:100%; height:100%; display:block;}
+
+  /* ---- 顶栏 ---- */
+  header{position:fixed; top:0; left:0; right:0; z-index:20; display:flex; align-items:center;
+    justify-content:space-between; padding:12px 18px; pointer-events:none;}
+  header .brand{display:flex; align-items:center; gap:10px;}
+  header .logo{width:34px; height:34px; border-radius:50%; display:grid; place-items:center;
+    background:radial-gradient(circle at 32% 30%, #4C8DFF, #16233C 75%);
+    box-shadow:0 0 14px rgba(76,141,255,.55); font-size:17px;}
+  header h1{font-size:16px; font-weight:600; letter-spacing:1px;}
+  header .sub{font-size:10px; color:var(--muted); letter-spacing:2.5px;}
+  .stats{display:flex; gap:10px; pointer-events:auto;}
+  .stat{min-width:64px; padding:6px 12px; text-align:center; border:1px solid var(--line);
+    border-radius:10px; background:var(--panel2); backdrop-filter:blur(8px);}
+  .stat b{display:block; font-size:18px; font-weight:600; color:var(--text);}
+  .stat span{font-size:11px; color:var(--muted);}
+
+  /* ---- 左栏：分组列表 ---- */
+  aside.left{position:fixed; left:14px; top:64px; bottom:86px; width:264px; z-index:20;
+    display:flex; flex-direction:column; gap:10px; overflow-y:auto; scrollbar-width:thin;
+    padding-right:4px;}
+  .group{border:1px solid var(--line); border-radius:12px; background:var(--panel);
+    backdrop-filter:blur(10px); padding:8px 6px 6px;}
+  .group-h{display:flex; align-items:center; gap:8px; padding:4px 8px 8px; font-size:12px;
+    color:var(--muted); letter-spacing:.5px;}
+  .dot{width:8px; height:8px; border-radius:50%; flex:none;}
+  .group-h .n{margin-left:auto; opacity:.7;}
+  .node-row{display:flex; align-items:center; gap:8px; width:100%; text-align:left;
+    padding:6px 8px; border-radius:8px; font-size:13px; border:1px solid transparent;}
+  .node-row:hover:not(:disabled){background:rgba(76,141,255,.10);}
+  .node-row:disabled{cursor:not-allowed; color:var(--muted); opacity:.55;}
+  .node-row.current{border-color:rgba(232,178,58,.55); background:rgba(232,178,58,.08);}
+  .node-row .st{width:14px; text-align:center; flex:none; font-size:12px;}
+  .node-row .lb{overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+
+  /* ---- 右栏：卡片 ---- */
+  aside.right{position:fixed; right:14px; top:64px; bottom:86px; width:344px; z-index:20;
+    overflow-y:auto; scrollbar-width:thin; display:flex; flex-direction:column; gap:10px;
+    transition:transform .3s ease, opacity .3s ease;}
+  aside.right.collapsed{transform:translateX(calc(100% + 24px)); opacity:0; pointer-events:none;}
+  .btn-toggle{cursor:pointer; color:var(--text); font-size:15px; line-height:1; padding:6px 12px;}
+  /* 过滤态：必须一眼看出"现在只有一部分节点在图上"，否则用户以为星图坏了 */
+  .btn-toggle[aria-pressed="true"]{border-color:var(--gold); color:var(--gold);
+    box-shadow:0 0 0 1px rgba(232,178,58,.35) inset;}
+  .card{border:1px solid var(--line); border-radius:14px; background:var(--panel);
+    backdrop-filter:blur(12px); padding:14px 16px; box-shadow:0 12px 34px rgba(0,0,0,.45);}
+  .card h2{font-size:17px; font-weight:600; margin-bottom:2px;}
+  .card h3{font-size:12px; font-weight:600; color:var(--muted); letter-spacing:1px;
+    margin:12px 0 6px; text-transform:uppercase;}
+  .card .scope{font-size:12px; color:var(--muted); margin-bottom:8px;}
+  .card .body{font-size:14px; line-height:1.85; white-space:pre-wrap;}
+  .cite{display:inline-block; margin:0 2px; padding:0 7px; border-radius:6px; font-size:12px;
+    color:#0E1420; background:linear-gradient(180deg,#F0C260,#E8B23A); font-weight:600;}
+  .btn{display:inline-flex; align-items:center; justify-content:center; gap:6px; padding:7px 12px;
+    border:1px solid var(--line); border-radius:9px; font-size:13px;
+    background:rgba(76,141,255,.14); transition:background .15s;}
+  .btn:hover{background:rgba(76,141,255,.28);}
+  .btn.gold{background:rgba(232,178,58,.16); border-color:rgba(232,178,58,.45);}
+  .btn.gold:hover{background:rgba(232,178,58,.28);}
+  .btn.ghost{background:transparent;}
+  .btn.wide{width:100%;}
+  .btn:disabled{opacity:.45; cursor:not-allowed;}
+  .btn-row{display:flex; gap:8px; flex-wrap:wrap; margin-top:8px;}
+  .chip{display:inline-flex; align-items:center; gap:6px; padding:3px 10px; border-radius:999px;
+    font-size:12px; border:1px solid var(--line); background:rgba(76,141,255,.10); margin:0 4px 4px 0;}
+  .chip.green{border-color:rgba(63,191,127,.5); background:rgba(63,191,127,.12); color:#9BE7BE;}
+  .chip.gold{border-color:rgba(232,178,58,.5); background:rgba(232,178,58,.12); color:#F3D68B;}
+  .chip.red{border-color:rgba(229,84,75,.5); background:rgba(229,84,75,.12); color:#F5A9A3;}
+  .kv{display:flex; justify-content:space-between; gap:10px; font-size:13px; padding:5px 0;
+    border-bottom:1px dashed rgba(90,120,170,.16);}
+  .kv span:first-child{color:var(--muted);}
+  .kv select{max-width:210px; padding:3px 6px; border:1px solid var(--line); border-radius:6px;
+    background:rgba(5,8,15,.92); color:var(--text); font:inherit; font-size:12px; outline:none;}
+  .kv select:focus{border-color:rgba(76,141,255,.6);}
+  .tip{font-size:12px; color:var(--muted); margin-top:6px;}
+
+  /* ---- 底部问答 ---- */
+  footer{position:fixed; left:50%; bottom:18px; transform:translateX(-50%); z-index:20;
+    width:min(620px, calc(100vw - 640px)); display:flex; gap:8px;}
+  footer input{flex:1; padding:11px 16px; border:1px solid var(--line); border-radius:12px;
+    background:var(--panel); color:var(--text); font:inherit; backdrop-filter:blur(10px); outline:none;}
+  footer input:focus{border-color:rgba(76,141,255,.6);}
+  footer .btn{border-radius:12px; padding:11px 18px;}
+
+  /* ---- 悬浮提示 ---- */
+  #tip{position:fixed; z-index:30; padding:7px 10px; border-radius:9px; font-size:12px;
+    border:1px solid var(--line); background:var(--panel); pointer-events:none;
+    backdrop-filter:blur(10px); box-shadow:0 10px 26px rgba(0,0,0,.5); max-width:260px;}
+  .tip-h{display:flex; align-items:center; gap:8px; white-space:nowrap;}
+  .tip-h b{font-size:13px; font-weight:600;}
+  .tip-s{margin-left:auto; padding:1px 7px; border-radius:999px; font-style:normal;
+    font-size:11px; border:1px solid;}
+  .tip-s.un{color:#F3D68B; border-color:rgba(232,178,58,.55); background:rgba(232,178,58,.14);}
+  .tip-s.cl{color:#9BE7BE; border-color:rgba(63,191,127,.5); background:rgba(63,191,127,.12);}
+  .tip-s.lo{color:var(--muted); border-color:var(--line); background:rgba(90,120,170,.10);}
+  .tip-k{display:flex; flex-wrap:wrap; gap:4px; margin-top:5px;}
+  .tip-k span{padding:1px 7px; border-radius:6px; font-size:11px; color:#BCD6F5;
+    background:rgba(76,141,255,.14); border:1px solid rgba(76,141,255,.30);}
+
+  @media (max-width:1100px){
+    footer{width:min(620px, calc(100vw - 40px));}
+    aside.left{display:none;}
+  }
+</style>
+</head>
+<body>
+<canvas id="sky" aria-hidden="true"></canvas>
+<div id="tip" hidden></div>
+
+<header>
+  <div class="brand">
+    <div class="logo" aria-hidden="true">🧭</div>
+    <div><h1>知识星河</h1><div class="sub">VALUE COMPASS · 财报知识星图</div></div>
+  </div>
+  <nav class="stats" aria-label="星图统计">
+    <button id="panelToggle" class="stat btn-toggle" title="收起右侧卡片">»</button>
+    <button id="viewReset" class="stat btn-toggle" title="恢复默认视角（双击星空也可）">⌂</button>
+    <button id="nodeCreate" class="stat btn-toggle" title="新建星图节点">＋</button>
+    <div class="stat"><b id="st_unlocked">0</b><span>已点亮</span></div>
+    <div class="stat"><b id="st_clickable">0</b><span>可点亮</span></div>
+    <div class="stat"><b id="st_new">0</b><span>新发现</span></div>
+    <div class="stat"><b id="st_edges">0</b><span>我的关联</span></div>
+    <button id="st_mine" class="stat btn-toggle" title="只看我创建的节点（再点一次恢复全景）"
+      aria-pressed="false"><b id="st_mine_n">0</b><span>自建</span></button>
+  </nav>
+</header>
+
+<aside class="left" aria-label="星图节点列表"><div id="groups"></div></aside>
+<aside class="right" aria-label="节点详情" id="right"></aside>
+
+<footer>
+  <input id="q" type="search" placeholder="问点什么，例如：毛利率和净利润有什么关系？"
+         aria-label="向财报知识库提问" maxlength="500">
+  <button class="btn" id="ask">提问</button>
+</footer>
+
+<script>
+'use strict';
+// ====================== 契约与状态 ======================
+// 与后端约定：ui_payload 里这些键按**键**合并，其余保留上一轮（连边轮不下发 tiers，
+// 整体覆盖会让建边后所有已点亮节点瞬间失档）。
+const SM_KEYS = ['unlocked_nodes', 'clickable', 'tiers', 'session_edges'];
+const S = {
+  threadId: localStorage.getItem('vc_thread') || ('web_' + Math.random().toString(36).slice(2, 10)),
+  sm: {},           // 合并后的星图视图
+  payload: null,    // 最新 ui_payload（渲染右栏）
+  answer: '',       // 最新 final_answer
+  labels: {},       // id -> label
+  keywords: {},     // id -> [检索关键词]（后端下发，hover 提示用）
+  drafts: new Set(),  // 占位节点 id（内容待补，暂不可点亮）
+  mine: new Set(),    // 我创建的节点 id（origin=user，区别于模型提议的）
+  sess: new Set(),    // 本会话新增节点 id（自建 + 模型提议）：不在 SM_KEYS 里，得单独存
+  focusMine: false,   // 只看我创建的节点（再点恢复全景）
+  groupOf: {},      // id -> group name
+  colorOf: {},      // id -> group color
+  base: {},         // id -> {x,y,ph,wx,wy} 布局基坐标（只在 resize 时重算）
+  pos: {},          // id -> {x,y} 当帧渲染/命中坐标（= base + 漂移 + 视差）
+  hover: null,
+  busy: false,
+  confirmResetAll: false,
+  company: null,   // 作用域：公司（可选上下文，不选=跨公司口径）
+  period: null,    // 作用域：报告期
+};
+localStorage.setItem('vc_thread', S.threadId);
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g,
+  (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+async function apiGet(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error('GET ' + url + ' -> ' + r.status);
+  return r.json();
+}
+async function ask(body) {
+  const r = await fetch('/ask', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(Object.assign({thread_id: S.threadId}, body))});
+  if (!r.ok) throw new Error('/ask -> ' + r.status);
+  return r.json();
+}
+
+// ====================== 星图视图合并 ======================
+function mergeSm(payload, topLevel) {
+  for (const k of SM_KEYS) if (payload && k in payload) S.sm[k] = payload[k];
+  // /ask 的 ui_payload 不带星图键，权威最新值在响应顶层 —— 必须每轮采纳。
+  // 旧逻辑只在 sm.unlocked_nodes 为 null 时兜底，首屏快照把它设成 [] 后
+  // 顶层更新就永远进不来，表现为"点亮了节点星图没反应"。
+  if (topLevel && Array.isArray(topLevel.unlocked_nodes)) S.sm.unlocked_nodes = topLevel.unlocked_nodes;
+  // 会话节点不在 SM_KEYS 里（那是星图视图键），单独合一次：
+  // 模型本轮提议的新节点要立刻出现在左栏，否则得等下次 /starmap 才看得到。
+  for (const id of Object.keys((payload && payload.session_nodes) || {})) S.sess.add(id);
+  for (const id of Object.keys((topLevel && topLevel.session_nodes) || {})) S.sess.add(id);
+}
+function unlocked() { return S.sm.unlocked_nodes || []; }
+function clickable() { return S.sm.clickable || []; }
+function tiers() { return S.sm.tiers || {}; }
+function edges() { return S.sm.session_edges || []; }
+
+// ====================== 数据加载 ======================
+// quiet=true 只刷星图快照，不再触发慢的 /stats（新建节点后重拉时用）
+async function boot(quiet) {
+  try {
+    const snap = await apiGet('/starmap?thread_id=' + encodeURIComponent(S.threadId));
+    // /stats 实测能跑到 25s（扫文档目录），绝不能挡住首屏：星图先渲染，
+    // 它只喂右栏的公司/期间下拉，后台补上再重渲染右栏即可。
+    if (!quiet) loadDocs();
+    // groups.color 下发的是色词（gold/blue/green…），映射成具体色值；
+    // 星图 5 组实际只用 3 个词，同色词再按组名微调，避免"结构与治理"和"定性披露"分不清。
+    const WORD2HEX = {gold:'#E8B23A', blue:'#4C8DFF', green:'#3FBF7F', violet:'#8B5CF6',
+      cyan:'#57D4E0', red:'#E5544B'};
+    const TWEAK = {'现金流量':'#57D4E0', '定性披露':'#9B8CFF'};
+    for (const g of snap.groups || []) {
+      const c = TWEAK[g.name] || WORD2HEX[g.color] || (g.color && g.color[0] === '#' ? g.color : '#4C8DFF');
+      for (const n of g.nodes || []) {
+        S.labels[n.id] = n.label; S.groupOf[n.id] = g.name; S.colorOf[n.id] = c;
+      }
+    }
+    // 会话节点（用户新建 / 模型提议）必须落进某个分组：layout() 只遍历 groupOf，
+    // 不分组的话节点写进去了也不出现在星图上，表现为"建了却看不到"。
+    for (const [id, lb] of Object.entries(snap.session_nodes || {})) {
+      S.labels[id] = lb; S.groupOf[id] = '新发现'; S.colorOf[id] = '#57D4E0';
+    }
+    S.drafts = new Set(snap.draft_nodes || []);
+    S.mine = new Set(snap.user_nodes || []);
+    S.sess = new Set(Object.keys(snap.session_nodes || {}));
+    // 节点被清掉后（重置会话）还留在过滤态，就是一张空图，等于把用户锁死
+    if (S.focusMine && !S.mine.size) S.focusMine = false;
+    S.keywords = snap.node_keywords || {};
+    S.ruleEdges = snap.rule_edges || [];
+    S.seedNodes = snap.seed_nodes || [];
+    mergeSm(snap, snap);
+    layout(); renderRight(); renderGroups(); renderStats();
+  } catch (e) {
+    $('right').innerHTML = '<div class="card"><h2>星图加载失败</h2><div class="body">' +
+      esc(e.message) + '</div><div class="tip">请确认后端已启动（uvicorn apps.api:app）。</div></div>';
+  }
+}
+
+// 后台补拉文档清单（作用域下拉用），失败也不影响星图。
+async function loadDocs() {
+  try {
+    const st = await apiGet('/stats');
+    S.docs = st.docs || [];
+    if (Object.keys(S.groupOf).length) renderRight();   // 星图已渲染才需要补刷新下拉
+  } catch (e) { S.docs = S.docs || []; }
+}
+
+// ====================== 布局：分组星团（素材 1 的星团感） ======================
+// 投影中心：按左右面板**实测**占位计算 —— 写死 290/360 在窄窗口下会把星图挤偏、
+// 把点亮节点压到面板底下。右栏收起后量到的可视区变宽，星图自动占满剩余区域。
+const CENTER = {x: 0, y: 0};
+function measureStage() {
+  const w = innerWidth, h = innerHeight;
+  const lEl = document.querySelector('aside.left'), rEl = document.querySelector('aside.right');
+  const lw = lEl ? lEl.getBoundingClientRect().right : 290;
+  // 右栏用 offsetWidth 而不是 rect.left：收起是 transform 位移，rect 会量到
+  // 滑出屏幕后的位置，星图中心跟着整体偏到右下角（"星图跑到角落"的元凶之一）
+  const rw = rEl ? w - 14 - rEl.offsetWidth : w - 360;
+  CENTER.x = lw + Math.max(160, rw - lw) / 2;
+  CENTER.y = h / 2 + 6;
+  return {vw: Math.max(420, rw - lw), h};
+}
+function layout() {
+  const w = innerWidth, h = innerHeight;
+  const {vw} = measureStage();
+  const names = [...new Set(Object.values(S.groupOf))];
+  const R = Math.min(vw, h) * 0.34;
+  names.forEach((g, gi) => {
+    // 簇心：均匀环形 + 内外圈错落（不用随机哈希：会让某一团孤零零跑到远处）
+    const ang = (gi / names.length) * Math.PI * 2 - Math.PI / 2 + 0.38;
+    const rr = R * (gi % 2 ? 0.66 : 1.0);
+    // 世界坐标以投影中心为原点（不是屏幕坐标）：否则投影再乘 dist*k 会整体放大跑出屏幕
+    const gx = Math.cos(ang) * rr, gy = Math.sin(ang) * rr * 0.86;
+    const ids = Object.keys(S.groupOf).filter((id) => S.groupOf[id] === g);
+    const clusterR = Math.min(vw, h) * 0.105 + ids.length * 2.4;
+    // 整簇共用相位 -> 一团星星同向漂；簇内再叠个体差 -> 不至于像刚体整体平移
+    const gph = gi * 1.7;
+    // 每簇一个 z 层次 + 簇内确定性扰动：转视角时才有前后纵深，而不是一张平面纸
+    const zBase = (gi - (names.length - 1) / 2) * R * 0.28;
+    ids.forEach((id, i) => {
+      // 黄金角螺旋：组内均匀散开又不重叠
+      const t = (i + 0.6) / ids.length;
+      const a = i * 2.399963, d = clusterR * Math.sqrt(t);
+      const hsh = Math.sin(i * 127.1 + gi * 311.7) * 43758.5453;
+      S.base[id] = {
+        x: gx + Math.cos(a) * d * 1.5, y: gy + Math.sin(a) * d,
+        z: zBase + (hsh - Math.floor(hsh) - 0.5) * R * 0.16,
+        ph: gph + i * 0.55,
+        wx: 0.95 + (gi % 3) * 0.18,   // 李萨如双频：周期约 5~9s，各簇错开
+        wy: 0.72 + (i % 4) * 0.14,
+      };
+    });
+  });
+  // pos 同步一份近似屏幕坐标：loop 没起来时（boot 失败）也不至于空指针
+  S.pos = {};
+  for (const [id, b] of Object.entries(S.base))
+    S.pos[id] = {x: CENTER.x + b.x, y: CENTER.y + b.y, k: 1, z: b.z};
+}
+
+// ====================== 背景星野（素材 1 的深空感） ======================
+// 480 颗：其中 8% 是"亮星"，闪得深又快（肉眼能捕捉到的动感基本全靠它们）；
+// 其余只做慢呼吸，负责铺底密度。全亮会变成噪点墙，全暗就完全没有动静。
+const stars = Array.from({length: 480}, () => {
+  const bh = Math.random() < 0.08;
+  return {
+    x: Math.random(), y: Math.random(),
+    r: bh ? Math.random() * 1.0 + 1.1 : Math.random() * 0.9 + 0.3,
+    ph: Math.random() * Math.PI * 2,
+    sp: bh ? 2.2 + Math.random() * 2.6 : 0.3 + Math.random() * 1.0,
+    a0: bh ? 0.20 : 0.34, a1: bh ? 0.95 : 0.62,
+    c: Math.random() < 0.12 ? '190,220,255' : (Math.random() < 0.5 ? '255,240,210' : '235,240,250'),
+  };
+});
+
+const cv = $('sky'), ctx = cv.getContext('2d');
+// 画布像素必须按 canvas 的**实际显示尺寸**（clientWidth）算，不能按 innerWidth：
+// 浏览器缩放、Retina、拖到外接屏都会让 devicePixelRatio 变化，一旦 backing 尺寸
+// 与 CSS 尺寸不符，画面会被整体拉伸 —— 看到的节点位置和 hit() 用的 S.pos 错位，
+// 表现为"图跑到角落""鼠标悬上去没反应、点也点不动"。
+function resize() {
+  const dpr = devicePixelRatio || 1;
+  // clientWidth 异常时（理论上 CSS 已固定 100%，但 canvas 固有尺寸一旦泄漏会自反馈放大）
+  // 退回视口尺寸，避免 backing 尺寸滚雪球
+  const cw = cv.clientWidth, ch = cv.clientHeight;
+  const w = (cw > 0 && cw <= innerWidth * 1.5) ? cw : innerWidth;
+  const h = (ch > 0 && ch <= innerHeight * 1.5) ? ch : innerHeight;
+  cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  layout();
+}
+addEventListener('resize', resize); resize();
+
+// dpr 变化（换屏/缩放）不一定触发 resize 事件，这里监听分辨率媒体查询兜底
+let dprMQ = null;
+function watchDpr() {
+  if (dprMQ) dprMQ.removeEventListener('change', onDpr);
+  dprMQ = matchMedia('(resolution: ' + (devicePixelRatio || 1) + 'dppx)');
+  dprMQ.addEventListener('change', onDpr);
+}
+function onDpr() { resize(); watchDpr(); }
+watchDpr();
+
+const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+// ---------------- 右侧卡片面板：手动收起/弹出 ----------------
+// 收起只是 transform 滑出屏幕，DOM 保留；星图在过渡结束后重新居中（重新量面板）。
+let panelOpen = true;
+function setPanel(open) {
+  panelOpen = open;
+  const asideEl = document.querySelector('aside.right');
+  if (asideEl) asideEl.classList.toggle('collapsed', !open);
+  const t = $('panelToggle');
+  if (t) { t.textContent = open ? '»' : '«'; t.title = open ? '收起右侧卡片' : '展开右侧卡片'; }
+  // 量宽已不受 transform 影响，收起/展开即时重测即可
+  measureStage();
+}
+$('panelToggle').addEventListener('click', () => setPanel(!panelOpen));
+$('viewReset').addEventListener('click', () => { resetView(); note('视角已复位'); });
+
+// 漂移幅度：实测 1.8px 时 0.9s 只挪 0.5px，肉眼判不出来；3px 是"看得见又不晃眼"的档。
+// 只作用于渲染坐标，S.base 不动。
+const AMP = 3.0;
+const par = {x: 0, y: 0}, parT = {x: 0, y: 0};
+if (!reduceMotion) {
+  addEventListener('pointermove', (e) => {
+    parT.x = -(e.clientX / innerWidth - 0.5) * 16;   // 视差 ±8px
+    parT.y = -(e.clientY / innerHeight - 0.5) * 12;  // 视差 ±6px
+  }, {passive: true});
+}
+
+// ---------------- 3D 相机（canvas 2D 自实现，零依赖）----------------
+// yaw 绕世界 Y 轴、pitch 绕视图 X 轴、dist 是缩放（同时是透视强度来源）。
+// F 是焦距：viewZ 越远投影因子越小，节点近大远小 —— 没有它就只是会转的平面图。
+const F = 1400;
+const cam = {yaw: 0, pitch: -0.18, dist: 1.0};
+const CAM_HOME = {yaw: 0, pitch: -0.18, dist: 1.0};
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+// pan: manual offset added to CENTER, so the whole map can be dragged around
+const pan = {x: 0, y: 0};
+function resetView() {
+  cam.yaw = CAM_HOME.yaw; cam.pitch = CAM_HOME.pitch; cam.dist = CAM_HOME.dist;
+  pan.x = 0; pan.y = 0;   // 一并复位，否则视角回正了星图还在别处
+}
+
+// 漂移发生在世界坐标 x/y 上：旋转视角后漂移方向也跟着坐标系走，观感自然
+function driftXY(b, s) {
+  if (reduceMotion) return {dx: 0, dy: 0};
+  return {
+    dx: Math.sin(s * b.wx + b.ph) * AMP,
+    dy: Math.cos(s * b.wy + b.ph * 1.7) * AMP * 0.8,
+  };
+}
+let nowSec = 0;   // 拖节点时的迭代重投影要用同一时刻的漂移量，否则会跟漂移"打架"
+
+// 把单个节点投到屏幕坐标（拖动迭代用）。与 projectAll 共用同一套公式。
+function projectOne(id) {
+  const b = S.base[id], p = S.pos[id];
+  if (!b || !p) return;
+  const {dx, dy} = driftXY(b, nowSec);
+  const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw);
+  const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+  const wx = b.x + dx, wy = b.y + dy, wz = b.z || 0;
+  const x1 =  cy * wx + sy * wz;
+  const z1 = -sy * wx + cy * wz;
+  const y2 =  cp * wy - sp * z1;
+  const z2 =  sp * wy + cp * z1;
+  const vz = z2 * cam.dist;
+  const k = clamp(F / (F + vz), 0.35, 2.8);
+  p.x = CENTER.x + pan.x + x1 * cam.dist * k + par.x;
+  p.y = CENTER.y + pan.y + y2 * cam.dist * k + par.y;
+  p.k = k; p.z = vz;
+}
+
+// 命中检测读的是 S.pos（屏幕坐标），所以节点转到哪/飘到哪，鼠标就命中到哪。
+// 返回按深度降序的 [id, viewZ] 列表：远的先画，近的压在上面。
+function projectAll(t) {
+  const s = t / 1000;
+  nowSec = s;
+  par.x += (parT.x - par.x) * 0.05;   // 缓动跟随，避免鼠标一动画面就跳
+  par.y += (parT.y - par.y) * 0.05;
+  const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw);
+  const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+  const order = [];
+  for (const [id, b] of Object.entries(S.base)) {
+    const off = driftXY(b, s);
+    const wx = b.x + off.dx, wy = b.y + off.dy, wz = b.z || 0;
+    const x1 =  cy * wx + sy * wz;          // Ry(yaw)
+    const z1 = -sy * wx + cy * wz;
+    const y2 =  cp * wy - sp * z1;          // Rx(pitch)
+    const z2 =  sp * wy + cp * z1;
+    const vz = z2 * cam.dist;
+    const k = clamp(F / (F + vz), 0.35, 2.8);   // 透视因子：近大远小
+    const p = S.pos[id] || (S.pos[id] = {x: 0, y: 0, k: 1, z: 0});
+    p.x = CENTER.x + pan.x + x1 * cam.dist * k + par.x;
+    p.y = CENTER.y + pan.y + y2 * cam.dist * k + par.y;
+    p.k = k; p.z = vz;
+    order.push([id, vz]);
+  }
+  order.sort((a, b) => b[1] - a[1]);
+  return order;
+}
+
+let _cssW = 0, _cssH = 0;
+function loop(t) {
+  const w = innerWidth, h = innerHeight;
+  // 兜底自检：canvas 显示尺寸与视口一旦对不上（缩放/dpr 变化没派发事件）就自愈重排，
+  // 否则画面被拉伸、命中坐标整片错位，鼠标会彻底点不动节点。
+  if (cv.clientWidth !== _cssW || cv.clientHeight !== _cssH) {
+    _cssW = cv.clientWidth; _cssH = cv.clientHeight; resize();
+  }
+  ctx.clearRect(0, 0, w, h);
+  const order = projectAll(t);
+  const now = t / 1000;
+
+  // 背景星野：跟随视角做轻微反向偏移，强化"星图在转、星海在退"的纵深感
+  const shx = ((cam.yaw * -60) % w + w) % w, shy = cam.pitch * -45;
+  for (const s of stars) {
+    const k = reduceMotion ? 0.5 : 0.5 + 0.5 * Math.sin(t / 1000 * s.sp + s.ph);
+    ctx.fillStyle = 'rgba(' + s.c + ',' + (s.a0 + (s.a1 - s.a0) * k).toFixed(3) + ')';
+    const sx = (s.x * w + shx) % w, sy = s.y * h + shy;
+    // r<0.75 的点用 fillRect：这个尺寸下和 arc 肉眼无差，但省掉 480 次路径构建
+    if (s.r < 0.75) ctx.fillRect(sx, sy, s.r * 2, s.r * 2);
+    else { ctx.beginPath(); ctx.arc(sx, sy, s.r, 0, 7); ctx.fill(); }
+  }
+
+  // 规则边：两端至少一个已点亮时略亮（"走过的路"），其余保持可见但弱
+  const un = new Set(unlocked());
+  const focus = focusSet();
+  for (const e of (S.ruleEdges || [])) {
+    const p = S.pos[e.from], q = S.pos[e.to];
+    if (!p || !q) continue;
+    if (focus && !(focus.has(e.from) && focus.has(e.to))) continue;
+    const live = un.has(e.from) || un.has(e.to);
+    // 整幅 43 条边缓慢明灭（相位按位置错开，不会齐刷刷一起亮）
+    const br = reduceMotion ? 0 : Math.sin(now * 0.7 + (p.x + q.x) * 0.01) * 0.10;
+    ctx.strokeStyle = 'rgba(120,165,230,' + (live ? 0.58 + br : 0.16 + br * 0.4).toFixed(3) + ')';
+    ctx.lineWidth = live ? 1.6 : 0.8;
+    line(p, q);
+  }
+  // 会话边：亮青 + 流动虚线（用户自己连的，必须一眼可辨）
+  ctx.setLineDash([6, 5]);
+  if (!reduceMotion) ctx.lineDashOffset = -(t / 60) % 11;
+  ctx.strokeStyle = 'rgba(87,212,224,0.85)'; ctx.lineWidth = 1.6;
+  for (const e of edges()) {
+    const p = S.pos[e.from], q = S.pos[e.to];
+    if (focus && !(focus.has(e.from) && focus.has(e.to))) continue;
+    if (p && q) line(p, q);
+  }
+  ctx.setLineDash([]);
+
+  // 节点：按深度从远到近画，尺寸随透视因子缩放（近大远小是 3D 感的另一半）
+  const cl = new Set(clickable()), tr = tiers();
+  for (const [id] of order) {
+    if (focus && !focus.has(id)) continue;   // 过滤态：其余节点整颗隐去，不留残影
+    const p = S.pos[id];
+    const col = S.colorOf[id] || '#57D4E0';
+    const isUn = un.has(id), isCl = cl.has(id), tier = tr[id];
+    const isCur = S.payload && S.payload.node_id === id;
+    const isHov = S.hover === id;   // 悬停必须有反馈，否则整张图看着像死的
+    const kk = isHov ? 1.6 : 1;
+    if (isUn) {
+      const glow = tier === 'bright' ? 22 : tier === 'dim' ? 9 : 14;
+      halo(p, glow * p.k * (isHov ? 1.35 : 1), col, isHov ? 0.8 : 0.55);
+      ctx.fillStyle = '#FFFFFF';
+      dot(p, (tier === 'bright' ? 5.0 : tier === 'dim' ? 3.0 : 4.0) * p.k * kk);
+    } else if (isCl) {
+      const pulse = reduceMotion ? 0.5 : Math.sin(now * 2.2 + p.x) * 0.5 + 0.5;
+      halo(p, (12 + pulse * 10) * p.k * (isHov ? 1.3 : 1), col, (0.4 + pulse * 0.25) * (isHov ? 1.5 : 1));
+      ctx.fillStyle = 'rgba(238,245,255,.95)'; dot(p, 3.1 * p.k * kk);
+    } else {
+      halo(p, 4.5 * p.k * (isHov ? 2.2 : 1), col, isHov ? 0.45 : 0.16);
+      ctx.fillStyle = hexA(col, isHov ? 0.95 : 0.42); dot(p, 2.4 * p.k * kk);
+    }
+    if (isHov) {
+      ctx.strokeStyle = 'rgba(232,245,255,.9)'; ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.arc(p.x, p.y, 9 * p.k, 0, 7); ctx.stroke();
+    }
+    if (isCur) {
+      ctx.strokeStyle = 'rgba(232,178,58,.95)'; ctx.lineWidth = 1.6;
+      ctx.beginPath(); ctx.arc(p.x, p.y, (8.5 + (reduceMotion ? 0 : Math.sin(now * 3) * 1.2)) * p.k, 0, 7); ctx.stroke();
+    }
+  }
+  requestAnimationFrame(loop);
+}
+function line(p, q) { ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(q.x, q.y); ctx.stroke(); }
+function dot(p, r) { ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, 7); ctx.fill(); }
+function halo(p, r, col, a) {
+  const g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, r);
+  g.addColorStop(0, hexA(col, a)); g.addColorStop(1, hexA(col, 0));
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, 7); ctx.fill();
+}
+function hexA(hex, a) {
+  const n = parseInt((hex || '#4C8DFF').slice(1), 16);
+  return 'rgba(' + (n >> 16) + ',' + ((n >> 8) & 255) + ',' + (n & 255) + ',' + a + ')';
+}
+
+// ====================== canvas 交互 ======================
+// 指针三态：悬停节点 / 拖节点 / 拖空白转视角。用 pointer 事件统一鼠标与触控。
+const drag = {mode: null, id: null, lastX: 0, lastY: 0, moved: 0};
+
+// 节点状态：与后端 clickable/unlocked 同源，前端只做展示不重算。
+function nodeState(id) {
+  if ((unlocked() || []).includes(id)) return {k: 'un', t: '已点亮'};
+  if ((clickable() || []).includes(id)) return {k: 'cl', t: '可点亮'};
+  return {k: 'lo', t: '未点亮'};
+}
+
+// 悬停提示：名称 + 检索关键词 + 状态。只画真实知识节点；
+// 背景星野是纯装饰（不在 S.labels 里），本来就不参与命中。
+function setHover(id, x, y) {
+  S.hover = id;
+  const tip = $('tip');
+  if (!id) { tip.hidden = true; return; }
+  const st = nodeState(id);
+  const kws = (S.keywords[id] || []).filter(Boolean).slice(0, 3);
+  tip.innerHTML =
+    '<div class="tip-h"><b>' + esc(S.labels[id] || id) + '</b>' +
+    '<i class="tip-s ' + st.k + '">' + st.t + '</i></div>' +
+    (kws.length ? '<div class="tip-k">' + kws.map((k) =>
+      '<span>' + esc(k) + '</span>').join('') + '</div>' : '');
+  tip.hidden = false;
+  // 贴边翻转：提示框比节点大，压在右/下边缘会被裁掉
+  const r = tip.getBoundingClientRect();
+  const lx = x + 12 + r.width > innerWidth ? x - 12 - r.width : x + 12;
+  const ly = Math.min(y - 8, innerHeight - r.height - 8);
+  tip.style.left = Math.max(6, lx) + 'px';
+  tip.style.top = Math.max(6, ly) + 'px';
+}
+
+const touches = new Map();
+function centroid() {
+  let sx = 0, sy = 0;
+  for (const t of touches.values()) { sx += t.x; sy += t.y; }
+  return {x: sx / touches.size, y: sy / touches.size};
+}
+cv.addEventListener('pointerdown', (ev) => {
+  const id = hit(ev.clientX, ev.clientY);
+  drag.mode = id ? 'node' : 'orbit';
+  drag.id = id;
+  // 中键/右键/shift 左键 = 平移；否则拖节点或转视角
+  if (!id && (ev.button === 1 || ev.button === 2 || ev.shiftKey)) drag.mode = 'pan';
+  drag.lastX = ev.clientX; drag.lastY = ev.clientY;
+  drag.moved = 0;
+  if (ev.pointerType === 'touch') touches.set(ev.pointerId, {x: ev.clientX, y: ev.clientY});
+  try { cv.setPointerCapture(ev.pointerId); } catch (e) {}
+  cv.style.cursor = id ? 'grabbing' : 'move';
+});
+
+cv.addEventListener('pointermove', (ev) => {
+  if (touches.has(ev.pointerId)) touches.set(ev.pointerId, {x: ev.clientX, y: ev.clientY});
+  // 两指：跟中心点走=拖整张图；单指拖动在 down 时已判定为转视角/拖节点
+  if (ev.pointerType === 'touch' && touches.size >= 2) {
+    const c = centroid();
+    panView({clientX: c.x, clientY: c.y});
+    drag.lastX = c.x; drag.lastY = c.y;
+    return;
+  }
+  if (drag.mode === 'node') { dragNode(ev); return; }
+  if (drag.mode === 'pan') { panView(ev); return; }
+  if (drag.mode === 'orbit') { orbitView(ev); return; }
+  const id = hit(ev.clientX, ev.clientY);
+  setHover(id, ev.clientX, ev.clientY);
+  cv.style.cursor = id ? 'pointer' : 'default';
+});
+
+cv.addEventListener('pointerup', (ev) => {
+  touches.delete(ev.pointerId);
+  if (touches.size < 2) drag.lastX = ev.clientX, drag.lastY = ev.clientY;
+  const id = drag.mode === 'node' ? drag.id : null;
+  const isClick = id && drag.moved < 6;
+  drag.mode = null; drag.id = null;
+  cv.style.cursor = 'default';
+  // 位移小于阈值才算点击：否则"拖完松手"会被误判成点亮节点
+  if (isClick) clickNode(id, 'star');
+});
+cv.addEventListener('pointercancel', (ev) => {
+  touches.delete(ev.pointerId); drag.mode = null; drag.id = null;
+});
+
+// 屏幕位移 -> 世界 x/y 位移：先把透视除法乘回去，再做旋转的逆变换。
+// z 固定不变（节点在星图平面上拖），逆变换出的 wz 分量直接舍弃。
+// 逆投影是近似的（节点移动后透视因子 k 会变），所以迭代两次用残差修正 ——
+// 单次逆投影在 dist=1 时会留 ~7px 误差，迭代后 <1px，拖动才真正跟手。
+function dragNode(ev) {
+  const id = drag.id, b = S.base[id], p = S.pos[id];
+  if (!b || !p) return;
+  const dx = ev.clientX - drag.lastX, dy = ev.clientY - drag.lastY;
+  drag.lastX = ev.clientX; drag.lastY = ev.clientY;
+  drag.moved += Math.abs(dx) + Math.abs(dy);
+  setHover(id, ev.clientX, ev.clientY);
+  const want = {x: p.x + dx, y: p.y + dy};
+  for (let i = 0; i < 2; i++) {
+    const cur = S.pos[id];
+    const rx = want.x - cur.x, ry = want.y - cur.y;
+    if (Math.abs(rx) < 0.5 && Math.abs(ry) < 0.5) break;
+    const denom = F + cur.z;
+    if (Math.abs(denom) < 60) return;      // 投影分母过小会数值爆炸，放弃这步
+    const dvx = rx * denom / (F * cam.dist);
+    const dvy = ry * denom / (F * cam.dist);
+    const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw);
+    const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+    const wy = cp * dvy;                   // Rx(-pitch)
+    const z1 = -sp * dvy;
+    b.x += cy * dvx - sy * z1;             // Ry(-yaw)
+    b.y += wy;
+    projectOne(id);
+  }
+}
+
+function panView(ev) {
+  const dx = ev.clientX - drag.lastX, dy = ev.clientY - drag.lastY;
+  drag.lastX = ev.clientX; drag.lastY = ev.clientY;
+  drag.moved += Math.abs(dx) + Math.abs(dy);
+  pan.x = clamp(pan.x + dx, -innerWidth * 0.5, innerWidth * 0.5);
+  pan.y = clamp(pan.y + dy, -innerHeight * 0.5, innerHeight * 0.5);
+}
+
+function orbitView(ev) {
+  const dx = ev.clientX - drag.lastX, dy = ev.clientY - drag.lastY;
+  drag.lastX = ev.clientX; drag.lastY = ev.clientY;
+  drag.moved += Math.abs(dx) + Math.abs(dy);
+  cam.yaw += dx * 0.005;
+  cam.pitch = clamp(cam.pitch + dy * 0.005, -1.2, 1.2);
+}
+
+// 滚轮缩放：指数步进，手感均匀（不会在放大端猛、缩小端钝）
+cv.addEventListener('wheel', (ev) => {
+  ev.preventDefault();
+  const trackpadPan = !ev.ctrlKey && !ev.metaKey &&
+    (Math.abs(ev.deltaX) > 0 || Math.abs(ev.deltaY) < 40);
+  if (trackpadPan) {
+    pan.x = clamp(pan.x - ev.deltaX, -innerWidth * 0.5, innerWidth * 0.5);
+    pan.y = clamp(pan.y - ev.deltaY, -innerHeight * 0.5, innerHeight * 0.5);
+    return;
+  }
+  cam.dist = clamp(cam.dist * Math.exp(-ev.deltaY * 0.0012), 0.45, 2.6);
+}, {passive: false});
+
+// 视角恢复：拖空白转视角、滚轮缩放都不可逆，必须有出路。
+// 双击空白处恢复默认视角（双击在节点上会被 click 消费，不抢点亮操作）。
+cv.addEventListener('dblclick', (ev) => {
+  if (!hit(ev.clientX, ev.clientY)) { resetView(); note('视角已复位'); }
+});
+
+function hit(x, y) {
+  let best = null, bd = Infinity;
+  const focus = focusSet();
+  for (const [id, p] of Object.entries(S.pos)) {
+    // 隐去的节点必须同时退出命中：看不见却点得到，是最难排查的一类 bug
+    if (focus && !focus.has(id)) continue;
+    // 命中半径随透视缩放：拉近时节点大、命中圈也该大；拉远时反之
+    // 命中圈要盖住发光晕（halo 12~22px）：小于它就会出现"看着在节点上却没反应"
+    const rr = 18 * clamp(p.k || 1, 0.8, 1.6);
+    const d = Math.hypot(p.x - x, p.y - y);
+    if (d < rr && d < bd) { bd = d; best = id; }
+  }
+  return best;
+}
+
+// ====================== 交互动作 ======================
+function scopeFilters() {
+  // 公司是可选上下文：不选就走跨公司口径（通用解读 + 各家实例），不拦截点亮。
+  const f = {};
+  if (S.company) f.company = S.company;
+  if (S.period) f.report_period = S.period;
+  return f;
+}
+async function clickNode(id, via) {
+  if (S.busy) return;
+  S.busy = true; note('点亮「' + (S.labels[id] || id) + '」…');
+  try {
+    const f = Object.assign({node_id: id}, scopeFilters());
+    if (via) f.via = via;
+    const res = await ask({ui_action: 'click_star', ui_filters: f});
+    apply(res);
+  } catch (e) { note('请求失败：' + e.message); }
+  S.busy = false;
+}
+async function linkAction(src, target, confirmed, token) {
+  if (S.busy) return;
+  S.busy = true; note('建立关联…');
+  try {
+    const f = {node_id: src};
+    if (target) f.link_target = target;
+    if (confirmed) f.link_confirmed = true;
+    if (token) f.candidates_token = token;
+    const res = await ask({ui_action: 'link_confirm', ui_filters: f});
+    apply(res);
+  } catch (e) { note('请求失败：' + e.message); }
+  S.busy = false;
+}
+async function resetAll(allScope) {
+  if (S.busy) return;
+  S.busy = true; note('重置星图…');
+  S.confirmResetAll = false;
+  try {
+    const res = await ask({ui_action: allScope ? 'reset_starmap_all' : 'reset_starmap'});
+    S.sm = {};  // 快照一并清，否则渲染出"进度已清零但节点还亮着"的矛盾画面
+    apply(res);
+  } catch (e) { note('请求失败：' + e.message); }
+  S.busy = false;
+}
+async function askQuestion() {
+  const q = $('q').value.trim();
+  if (!q || S.busy) return;
+  S.busy = true; note('检索 → 融合 → 生成 → 校验…');
+  try {
+    const res = await ask({question: q, ui_action: 'natural_query'});
+    $('q').value = '';
+    apply(res);
+  } catch (e) { note('请求失败：' + e.message); }
+  S.busy = false;
+}
+// ====================== 新建节点 ======================
+// 用户主动建节点走独立入口：写进提问框会被当成自然语言检索（"帮我建个节点"
+// 只会换来一段检索回答），这是"想建节点却建不了"的根源。
+function createForm(fillId) {
+  const fill = !!fillId;
+  return '<div class="card"><h2>' + (fill ? '补充节点内容' : '新建星图节点') + '</h2>' +
+    '<div class="kv"><span>中文名</span><input id="nc_label" placeholder="如：存货周转率" maxlength="20" value="' +
+      esc(fill ? (S.labels[fillId] || '') : '') + '"></div>' +
+    '<div class="kv"><span>英文 id</span><input id="nc_id" placeholder="如：inventory_turnover" value="' +
+      esc(fillId || '') + '"' + (fill ? ' readonly' : '') + '></div>' +
+    '<div class="kv"><span>关键词</span><input id="nc_kw" placeholder="报告原文会出现的表述，逗号分隔（可留空）"></div>' +
+    '<div class="tip">关键词是召回锚点。<b>可以留空</b>：先占个位置（比如只填公司名），' +
+    '之后还能回来补。但空节点暂时点不亮——没有锚点，点亮只会召回不相干的内容。</div>' +
+    '<div class="row"><button id="nc_go" class="btn primary">' +
+      (fill ? '保存并验证' : '创建') + '</button>' +
+    '<button id="nc_x" class="btn">取消</button></div></div>';
+}
+function openCreate(fillId) {
+  $('right').innerHTML = createForm(fillId);
+  const bind = (id, fn) => { const el = $(id); if (el) el.addEventListener('click', fn); };
+  bind('nc_go', () => createNode());
+  bind('nc_x', () => renderRight());
+  const kw = $('nc_kw');
+  if (kw) kw.addEventListener('keydown', (e) => { if (e.key === 'Enter') createNode(); });
+  const l = $('nc_label'); if (l) l.focus();
+}
+async function createNode() {
+  if (S.busy) return;
+  const label = ($('nc_label').value || '').trim();
+  const id = ($('nc_id').value || '').trim().toLowerCase()
+    .replace(/[^a-z0-9_]/g, '_');
+  const kws = ($('nc_kw').value || '').split(/[,，;；\s]+/)
+    .map((s) => s.trim()).filter(Boolean).slice(0, 3);
+  if (!label) return note('请填写节点中文名');
+  if (!id) return note('请填写英文 id（小写英文/数字/下划线）');
+  // 关键词允许为空 —— 那就是"先占个位置"，后端建成占位节点，之后可回来补
+  S.busy = true; note('验证关键词可召回性…');
+  try {
+    const res = await ask({ui_action: 'create_node',
+      ui_filters: {node_id: id, label: label, keywords: kws}});
+    apply(res);
+    // 建成功才需要重拉：新节点要出现在星图上（被拒时星图没变，别白跑一次）
+    if ((res.ui_payload || {}).type === 'node_created') await boot(true);
+  } catch (e) { note('请求失败：' + e.message); }
+  S.busy = false;
+}
+$('nodeCreate').addEventListener('click', openCreate);
+
+$('ask').addEventListener('click', askQuestion);
+$('q').addEventListener('keydown', (e) => { if (e.key === 'Enter') askQuestion(); });
+
+function apply(res) {
+  S.payload = res.ui_payload || null;
+  S.answer = res.answer || '';
+  mergeSm(S.payload, res);
+  renderRight(); renderGroups(); renderStats();
+  // 点亮/提问产出了节点卡片就自动弹回右栏：刚拿到结果被藏起来会像"没反应"
+  if (S.payload && !panelOpen) setPanel(true);
+}
+
+function note(msg) {
+  $('right').innerHTML = '<div class="card"><div class="tip">' + esc(msg) + '</div></div>';
+}
+
+// ====================== DOM 渲染 ======================
+const ST_MARK = {bright:'●', mid:'◐', dim:'○'};
+function stateMark(id) {
+  const un = unlocked(), cl = clickable();
+  if (S.drafts.has(id)) return '⧗';   // 占位节点：内容待补，不是"锁着"
+  if (S.payload && S.payload.node_id === id && !S.payload.locked) return '◉';
+  if (un.includes(id)) return ST_MARK[tiers()[id]] || '◐';
+  if (cl.includes(id)) return '＋';
+  // 会话节点（我建的 / 模型提议的）后端一律放行点亮，但不在 clickable 列表里
+  // （它没有相邻已点亮节点）。标 🔒 会让用户以为点不动，其实点得开。
+  if (S.sess.has(id)) return '＋';
+  return '🔒';
+}
+
+// 过滤集合：null = 不过滤（全景）。开启时只留"我创建的节点"，
+// 外加与我相连的那一端——否则我连的边只剩半截悬在空中，看着像断线。
+function focusSet() {
+  if (!S.focusMine) return null;
+  const out = new Set(S.mine);
+  for (const e of edges()) {
+    if (S.mine.has(e.from)) out.add(e.to);
+    if (S.mine.has(e.to)) out.add(e.from);
+  }
+  return out;
+}
+
+function renderStats() {
+  $('st_unlocked').textContent = unlocked().length;
+  $('st_clickable').textContent = clickable().length;
+  $('st_new').textContent = S.sess.size
+    || (S.payload && S.payload.new_nodes ? S.payload.new_nodes.length : 0) || 0;
+  $('st_edges').textContent = edges().length;
+  $('st_mine_n').textContent = S.mine.size;
+  $('st_mine').setAttribute('aria-pressed', S.focusMine ? 'true' : 'false');
+  $('st_mine').title = S.focusMine ? '恢复全景（当前只看我创建的节点）'
+    : '只看我创建的节点（再点一次恢复全景）';
+}
+
+$('st_mine').addEventListener('click', () => {
+  if (!S.mine.size) return note('还没有你自己创建的节点。点右上角的 ＋ 可以新建一个。');
+  S.focusMine = !S.focusMine;
+  // 过滤只影响"看什么"，不重新布局：节点留在原处，全景回来时图还是同一张
+  renderStats(); renderGroups();
+  note(S.focusMine ? '只看我创建的节点（' + S.mine.size + ' 个），再点一次恢复。'
+    : '已恢复全景。');
+});
+
+function renderGroups() {
+  const un = new Set(unlocked()), cl = new Set(clickable());
+  const focus = focusSet();
+  const keep = (id) => !focus || focus.has(id);
+  const byGroup = {};
+  for (const [id, g] of Object.entries(S.groupOf)) if (keep(id)) (byGroup[g] = byGroup[g] || []).push(id);
+  let html = '';
+  if (focus) {
+    html += '<div class="tip">只看我创建的节点（' + S.mine.size +
+      ' 个）· 再点右上角「自建」恢复全景</div>';
+  }
+  for (const [g, ids] of Object.entries(byGroup)) {
+    if (!ids.length) continue;
+    html += '<section class="group"><div class="group-h"><span class="dot" style="background:' +
+      esc(S.colorOf[ids[0]] || '#4C8DFF') + '"></span>' + esc(g) +
+      '<span class="n">' + ids.filter((i) => un.has(i)).length + '/' + ids.length + '</span></div>';
+    for (const id of ids) {
+      const cur = S.payload && S.payload.node_id === id;
+      html += '<button class="node-row' + (cur ? ' current' : '') + '" data-id="' + esc(id) + '"' +
+        ' title="' + esc(S.labels[id] || id) + '"' +
+        (!un.has(id) && !cl.has(id) ? ' disabled' : '') + '>' +
+        '<span class="st">' + stateMark(id) + '</span><span class="lb">' + esc(S.labels[id] || id) + '</span></button>';
+    }
+    html += '</section>';
+  }
+  const sess = [...S.sess].filter(keep).map((id) => [id, S.labels[id] || id]);
+  if (sess.length) {
+    html += '<section class="group"><div class="group-h"><span class="dot" style="background:#57D4E0"></span>本会话新发现<span class="n">' + sess.length + '</span></div>';
+    for (const [id, lb] of sess) {
+      html += '<button class="node-row" data-id="' + esc(id) + '"><span class="st">' + stateMark(id) +
+        '</span><span class="lb">' + esc(lb || id) + '</span></button>';
+    }
+    html += '</section>';
+  }
+  $('groups').innerHTML = html;
+  for (const b of $('groups').querySelectorAll('.node-row[data-id]')) {
+    b.addEventListener('click', () => clickNode(b.dataset.id, 'star'));
+  }
+}
+
+function renderRight() {
+  const p = S.payload, el = $('right');
+  // 会话边展示（始终可见：用户连的边必须看得见）
+  const egdeChips = edges().map((e) =>
+    '<span class="chip green">' + esc(S.labels[e.from] || e.from) + ' ↔ ' +
+    esc(S.labels[e.to] || e.to) + '</span>').join('');
+
+  if (!p) {
+    el.innerHTML = scopeCardHtml() + '<div class="card"><h2>开始探索</h2><div class="body">点击星图上发光的节点，' +
+      '或在下方输入问题。🔒 的节点需要先点亮它相邻的指标。</div>' +
+      '<div class="tip">拖节点移动 · 拖空白转视角 · 滚轮缩放</div></div>' +
+      (egdeChips ? '<div class="card"><h3>我的关联</h3>' + egdeChips + '</div>' : '');
+    bindScope();
+    return;
+  }
+  // 新建节点的结果不是"知识卡片"（没有 explanation/scope），走自己的渲染分支，
+  // 否则被当成空卡片回落成默认的作用域卡，用户看不到"到底建成没有"。
+  if (p.type === 'node_created' || p.type === 'create_rejected') {
+    const ok = p.type === 'node_created';
+    el.innerHTML = scopeCardHtml() +
+      '<div class="card"><h2>' + (ok ? '已新建节点' : '节点未通过验证') + '</h2>' +
+      '<div class="scope">' + esc(p.label || p.node_id || '') + '</div>' +
+      (ok
+        ? (p.content_status === 'draft'
+            // 占位节点：重点不是"建好了"，而是"还差内容、点不亮、这里能补"
+            ? '<div class="body">' + esc(p.hint || '已新建占位节点，还没有内容。') + '</div>' +
+              '<div class="btn-row"><button class="btn primary" data-fill="' +
+              esc(p.node_id || '') + '">补充关键词</button></div>'
+            : '<div class="body">关键词命中率 ' + Number(p.probe_hit || 0).toFixed(2) +
+              '，已加入星图「新发现」组。它还没点亮，点一下即可查看内容。</div>' +
+              '<div class="body">' + (p.keywords || []).map((k) =>
+                '<span class="chip">' + esc(k) + '</span>').join(' ') + '</div>')
+          : '<div class="body">' + esc(p.hint || '未通过可召回性验证，请换用报告原文会出现的说法。') + '</div>') +
+      '</div>' + (egdeChips ? '<div class="card"><h3>我的关联</h3>' + egdeChips + '</div>' : '');
+    bindScope();
+    for (const b of el.querySelectorAll('[data-fill]'))
+      b.addEventListener('click', () => openCreate(b.dataset.fill));
+    return;
+  }
+  const scope = p.scope || {};
+  const scopeTxt = [scope.company, scope.report_period].filter(Boolean).join(' · ');
+  let html = scopeCardHtml() + '<div class="card"><h2>' + esc(p.label || p.node_id || '') + '</h2>' +
+    '<div class="scope">' + esc(scopeTxt || '未锁定公司/期间') + '</div>' +
+    '<div class="body">' + fmtAnswer(p.locked ? (p.explanation || S.answer) : (p.explanation || S.answer)) + '</div>';
+
+  // locked 出口：不能只说"没解锁"，必须给出口
+  if (p.locked) {
+    // 占位节点：只说"点不亮"不给补全入口，用户只能干瞪眼
+    if (p.fillable) {
+      html += '<h3>还差内容</h3><div class="btn-row"><button class="btn primary" data-fill="' +
+        esc(p.node_id || '') + '">补充关键词</button></div>';
+    }
+    const outs = [[p.next_hop, 'hop']].concat((p.alternatives || []).map((a) => [a, 'alt']))
+      .filter((x) => x[0] && x[0] !== p.next_hop || x[1] === 'hop');
+    const seen = new Set();
+    const rows = outs.filter((x) => x[0] && !seen.has(x[0]) && seen.add(x[0]));
+    if (rows.length) {
+      html += '<h3>可以先看</h3><div class="btn-row">' + rows.map((x) =>
+        '<button class="btn" data-hop="' + esc(x[0]) + '">▸ ' +
+        esc(S.labels[x[0]] || x[0]) + '</button>').join('') + '</div>';
+    } else {
+      html += '<div class="tip">继续点亮相邻指标，就会解锁更多。</div>';
+    }
+  }
+
+  // 引用角标
+  if (!p.locked && (p.citations || []).length) {
+    html += '<h3>溯源</h3><div>' + p.citations.slice(0, 12).map((c) =>
+      '<span class="cite" title="' + esc(c.section_path || '') + '">P' + esc(c.page) + '</span>').join('') + '</div>';
+  }
+  if (p.refused) html += '<div class="tip" style="margin-top:8px">⚠ 该节点在本期报告中未找到可溯源数据。</div>';
+
+  // 推荐点亮
+  const recs = (p.unlock_next || []).filter(Boolean);
+  if (!p.locked && recs.length) {
+    html += '<h3>推荐点亮</h3><div class="btn-row">' + recs.map((n) =>
+      '<button class="btn" data-hop="' + esc(n) + '">⭐ ' + esc(S.labels[n] || n) + '</button>').join('') + '</div>';
+  }
+
+  // 连边区：服务端回什么卡片就渲染什么，前端不做任何判定
+  if (!p.locked && !p.reset && p.node_id) {
+    html += linkZoneHtml(p);
+  }
+  html += '</div>';
+
+  if (egdeChips) html += '<div class="card"><h3>我的关联（' + edges().length + '）</h3>' + egdeChips + '</div>';
+
+  // 新发现
+  const news = p.new_nodes || [];
+  if (news.length) {
+    html += '<div class="card"><h3>本轮新发现</h3>' + news.map((n) =>
+      '<span class="chip">新 · ' + esc(n.label || n.id) + '</span>').join('') +
+      '<div class="tip">模型提议的科目，已通过可召回性验证才进星图（只在本会话有效）。</div></div>';
+  }
+
+  // reset 两档 + 视角复位
+  html += '<div class="card"><div class="btn-row" style="margin-top:0">' +
+    '<button class="btn ghost" id="rb1" title="只清点亮进度，新节点与连线都保留">重置进度</button>' +
+    (S.confirmResetAll
+      ? '<button class="btn gold" id="rb2">确认清除全部？</button>'
+      : '<button class="btn ghost" id="rb2" title="连新节点与连线一起清除，不可撤销">清除全部</button>') +
+    '<button class="btn ghost" id="rb3" title="把旋转/缩放/拖动恢复到初始视角">复位视角</button>' +
+    '</div></div>';
+
+  el.innerHTML = html;
+  bindScope();
+
+  for (const b of el.querySelectorAll('[data-hop]'))
+    b.addEventListener('click', () => clickNode(b.dataset.hop, 'text_link'));
+  for (const b of el.querySelectorAll('[data-fill]'))
+    b.addEventListener('click', () => openCreate(b.dataset.fill));
+  for (const b of el.querySelectorAll('[data-linkopt]'))
+    b.addEventListener('click', () => linkAction(p.node_id, b.dataset.linkopt));
+  const y = el.querySelector('#link_yes');
+  if (y) y.addEventListener('click', () =>
+    linkAction(p.node_id, p.link_target, true, p.candidates_token));
+  const n2 = el.querySelector('#link_no');
+  if (n2) n2.addEventListener('click', () => linkAction(p.node_id));
+  const la = el.querySelector('#link_ask');
+  if (la) la.addEventListener('click', () => linkAction(p.node_id));
+  const rb1 = el.querySelector('#rb1');
+  if (rb1) rb1.addEventListener('click', () => resetAll(false));
+  const rb2 = el.querySelector('#rb2');
+  if (rb2) rb2.addEventListener('click', () => {
+    if (S.confirmResetAll) resetAll(true);
+    else { S.confirmResetAll = true; renderRight(); }
+  });
+  const rb3 = el.querySelector('#rb3');
+  if (rb3) rb3.addEventListener('click', resetView);
+}
+
+function linkZoneHtml(p) {
+  const t = p.type || '';
+  const used = edges().length;
+  let html = '<h3>建立关联</h3>';
+  if (t === 'link_candidates') {
+    const opts = p.options || [];
+    if (p.stale) html += '<div class="tip">星图已经变了，请重新选择。</div>';
+    if (!opts.length) html += '<div class="tip">暂时找不到适合与它关联的指标。</div>';
+    for (const o of opts) {
+      html += '<button class="btn wide" style="margin:4px 0" data-linkopt="' + esc(o.node_id) + '">↔ ' +
+        esc(o.label || o.node_id) + '</button>';
+    }
+  } else if (t === 'link_confirm_card') {
+    html += '<div class="body">连接 <b>' + esc(p.label || '') + '</b> ↔ <b>' +
+      esc(p.link_label || '') + '</b>？</div><div class="btn-row">' +
+      '<button class="btn gold" id="link_yes">确认连接</button>' +
+      '<button class="btn ghost" id="link_no">换个指标</button></div>';
+  } else if (t === 'link_open') {
+    html += '<button class="btn wide" data-hop="' + esc(p.node_id) + '">打开 ' +
+      esc(S.labels[p.node_id] || p.node_id) + '</button>';
+  } else if (t.indexOf('link_') === 0) {
+    html += '<div class="tip">' + esc(S.answer || '') + '</div>';
+  } else {
+    html += '<button class="btn wide" id="link_ask">🔗 把「' + esc(S.labels[p.node_id] || p.node_id) +
+      '」与其他指标关联（' + used + '/5）</button>';
+  }
+  return html;
+}
+
+function card(title, inner) {
+  return '<div class="card"><h3>' + esc(title) + '</h3>' + inner + '</div>';
+}
+function sel(id, label, opts, cur, emptyLabel) {
+  if (!opts.length) return '';
+  // cur 为空时给个占位项：否则 select 会显示第一个选项，看着像"已选中"实际没选
+  const head = (emptyLabel && !cur)
+    ? '<option value="" selected>' + esc(emptyLabel) + '</option>' : '';
+  return '<div class="kv"><span>' + esc(label) + '</span><select id="' + id + '">' +
+    head +
+    opts.map((o) => '<option value="' + esc(o) + '"' + (o === cur ? ' selected' : '') + '>' +
+      esc(o) + '</option>').join('') + '</select></div>';
+}
+
+function buildScope(docs) {
+  if (!docs.length) return '';
+  const cs = [...new Set(docs.map((d) => d.company || d.short_name).filter(Boolean))];
+  const ps = [...new Set(docs.map((d) => d.report_period).filter(Boolean))].sort().reverse();
+  // 公司是**可选上下文**，不预选：点亮节点看的是科目本身的口径，选了公司才补实例数据。
+  // 预选会让"先选公司才能点"变回硬门槛，也会把没被选中的公司的资料挡在召回之外。
+  // 期间刻意不预选：带上期间会走硬过滤，实测 2026H1/2025A 全部触发 empty/num_mismatch
+  // 兜底、节点点不亮；不锁期间时后端自选最新期，链路是通的。用户要锁再手动选。
+  const inner = sel('sc_c', '公司', cs, S.company, '全部公司（跨公司口径）') +
+    sel('sc_p', '报告期', ps, S.period, '全部期间');
+  return inner ? card('作用域', inner +
+    '<div class="tip">公司可选：不选则看该科目的通用口径（跨公司实例会标注公司名）；' +
+    '选定后补充该公司的实例数据。期间不锁时后端自动取最新期。</div>') : '';
+}
+
+function scopeCardHtml() {
+  return buildScope(S.docs || []);
+}
+
+// 下拉只写回状态、不重渲染：重渲染会重建 select，且会把 confirmResetAll 一起冲掉。
+function bindScope() {
+  const root = $('right');
+  const sc = root.querySelector('#sc_c');
+  if (sc) sc.addEventListener('change', () => { S.company = sc.value; });
+  const sp = root.querySelector('#sc_p');
+  if (sp) sp.addEventListener('change', () => { S.period = sp.value || null; });
+}
+
+function fmtAnswer(text) {
+  // 先转义再替换 [P12] 角标，避免注入
+  return esc(text || '').replace(/\[P(\d+)\]/g, '<span class="cite">P$1</span>');
+}
+
+// 加载占位：/starmap 返回前右栏不再空着（配合下方立即启动的渲染循环，
+// 打开页面就是"星野在闪 + 加载提示"，而不是一片死黑）。
+$('right').innerHTML = '<div class="card"><h2>正在加载星图…</h2>' +
+  '<div class="body">正在连接后端并生成星图，请稍候。</div></div>';
+boot();
+
+// 渲染循环立即开跑：星野和空星图不依赖数据。此前 loop 要等 boot 成功才启动，
+// 接口慢的几秒里整个页面一片黑，像挂了一样。
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>

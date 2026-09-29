@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>value_compass · 星河层视觉稿</title>
+<!--
+  阶段 1 · 纯视觉稿：只验证「星河」的观感与性能，不接任何数据、不请求后端。
+  确认效果后并入 web/index.html，再叠加知识星图层（27 节点 Sprite）+ 交互 + 卡片。
+
+  three.js 固定 0.186.0：不用 latest，避免版本漂移导致后续 API 对不上。
+-->
+<style>
+  :root{
+    --bg:#0E1420; --panel:#161E2D; --line:#26314A;
+    --text:#E8EDF5; --muted:#9AA8BF; --blue:#2E6BE6; --blue2:#4C8DFF; --gold:#E8B23A;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;height:100%;overflow:hidden;color:var(--text);
+    font:13px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
+    /* 画布透明，底色沿用现有 CSS 变量那套 radial-gradient，保持与 Streamlit 版一致 */
+    background:radial-gradient(1200px 600px at 15% -10%, #16233C 0%, var(--bg) 55%) fixed;}
+  #app{position:fixed;inset:0;}
+  #app canvas{display:block;}
+
+  .hud{position:fixed;top:14px;right:14px;z-index:10;display:flex;gap:14px;align-items:center;
+    padding:7px 12px;border:1px solid var(--line);border-radius:10px;
+    background:rgba(22,30,45,.72);backdrop-filter:blur(8px);font-size:12px;color:var(--muted);}
+  .hud b{color:var(--text);font-weight:600;}
+
+  .panel{position:fixed;top:60px;right:14px;z-index:10;width:236px;padding:12px 14px;
+    border:1px solid var(--line);border-radius:12px;background:rgba(22,30,45,.82);
+    backdrop-filter:blur(10px);box-shadow:0 10px 30px rgba(0,0,0,.35);}
+  .panel h4{margin:0 0 10px;font-size:12px;font-weight:600;letter-spacing:.5px;color:var(--muted);}
+  .row{margin-bottom:10px;}
+  .row label{display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-bottom:4px;}
+  .row label span{color:var(--text);}
+  .row input[type=range]{width:100%;accent-color:var(--blue2);}
+  .row select{width:100%;padding:4px 6px;border:1px solid var(--line);border-radius:6px;
+    background:var(--bg);color:var(--text);font-size:12px;}
+  .row.check{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);}
+  .btn{width:100%;padding:6px;border:1px solid var(--line);border-radius:8px;cursor:pointer;
+    background:rgba(46,107,230,.16);color:var(--text);font-size:12px;}
+  .btn:hover{background:rgba(46,107,230,.28);}
+
+  .hint{position:fixed;left:16px;bottom:14px;z-index:10;font-size:12px;color:var(--muted);}
+  .brand{position:fixed;left:16px;top:14px;z-index:10;font-size:15px;letter-spacing:.2px;}
+  .brand small{display:block;font-size:12px;color:var(--muted);letter-spacing:0;}
+
+  #fallback{position:fixed;inset:0;display:none;place-items:center;text-align:center;padding:24px;}
+  #fallback div{max-width:420px;color:var(--muted);}
+  [hidden]{display:none !important;}
+</style>
+</head>
+<body>
+<div id="app"></div>
+
+<div class="brand">🧭 星河层 · 视觉稿<small>纯渲染验证，未接数据</small></div>
+
+<div class="hud">
+  <span>FPS <b id="fps">–</b></span>
+  <span>星点 <b id="count">–</b></span>
+  <span style="opacity:.6">H 收起面板</span>
+</div>
+
+<div class="panel" id="panel">
+  <h4>实时调参（调完把数值告诉我）</h4>
+  <div class="row">
+    <label>星点数 <span id="v_count"></span></label>
+    <input type="range" id="s_count" min="2000" max="40000" step="1000">
+  </div>
+  <div class="row">
+    <label>旋臂数 <span id="v_branch"></span></label>
+    <input type="range" id="s_branch" min="1" max="6" step="1">
+  </div>
+  <div class="row">
+    <label>旋臂紧密度 <span id="v_spin"></span></label>
+    <input type="range" id="s_spin" min="0.2" max="2.0" step="0.05">
+  </div>
+  <div class="row">
+    <label>盘面厚度 <span id="v_thick"></span></label>
+    <input type="range" id="s_thick" min="0.05" max="0.80" step="0.01">
+  </div>
+  <div class="row">
+    <label>自转速度 <span id="v_speed"></span></label>
+    <input type="range" id="s_speed" min="0" max="0.30" step="0.01">
+  </div>
+  <div class="row">
+    <label>配色</label>
+    <select id="s_palette">
+      <option value="gold-blue">金蓝（默认）</option>
+      <option value="cold-blue">冷蓝</option>
+      <option value="violet-gold">紫金</option>
+    </select>
+  </div>
+  <div class="row check"><input type="checkbox" id="c_pause"><label for="c_pause">暂停自转</label></div>
+  <button class="btn" id="b_reset">重置视角</button>
+</div>
+
+<div class="hint">拖拽旋转 · 滚轮缩放 · 移动鼠标微视差</div>
+
+<div id="fallback"><div>
+  <b style="color:var(--text)">当前环境不支持 WebGL</b><br>
+  星河层需要 WebGL 才能渲染。降级方案（下一步实现）会回落为按分组排列的节点列表视图。
+</div></div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.186.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.186.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ---------------- 参数 ----------------
+const PALETTES = {
+  'gold-blue':   { inner:'#FFD9A3', outer:'#2E6BE6', core:'#E8B23A' },
+  'cold-blue':   { inner:'#D6E6FF', outer:'#1B3E8C', core:'#4C8DFF' },
+  'violet-gold': { inner:'#FFE9B8', outer:'#8B5CF6', core:'#F0C260' },
+};
+
+const params = {
+  count:   window.innerWidth < 900 ? 5000 : 12000, // 移动端自动降密度
+  branches: 3,
+  spin: 1.05,
+  thickness: 0.28,
+  radius: 6.0,
+  randomness: 0.85,   // 旋臂散开程度
+  power: 3.0,         // 越大越向核心集中
+  speed: 0.06,
+  palette: 'gold-blue',
+};
+
+const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+if (reduceMotion) params.speed = 0;
+
+// ---------------- 场景 ----------------
+const host = document.getElementById('app');
+let renderer;
+try {
+  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+} catch (e) {
+  document.getElementById('fallback').style.display = 'grid';
+  throw e;
+}
+renderer.setClearColor(0x000000, 0);            // 透明，露出 CSS 渐变底
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+host.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.1, 200);
+camera.position.set(0, 3.0, 8.6);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.06;
+controls.enablePan = false;
+controls.minDistance = 2.2;
+controls.maxDistance = 26;
+
+// world 承担视差倾斜，galaxy 承担自转：两者分离，OrbitControls 只管相机，互不打架
+const world = new THREE.Group();
+const galaxy = new THREE.Group();
+const dust = new THREE.Group();
+world.add(galaxy, dust);
+scene.add(world);
+
+// ---------------- 贴图（canvas 现画，零外部依赖）----------------
+function radialTexture(stops) {
+  const s = 128, c = document.createElement('canvas');
+  c.width = c.height = s;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(s / 2, s / 2, 0, s / 2, s / 2, s / 2);
+  for (const [at, color] of stops) g.addColorStop(at, color);
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, s, s);
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+const starTex = radialTexture([
+  [0.00, 'rgba(255,255,255,1)'],
+  [0.22, 'rgba(255,255,255,0.72)'],
+  [0.55, 'rgba(255,255,255,0.18)'],
+  [1.00, 'rgba(255,255,255,0)'],
+]);
+const coreTex = radialTexture([
+  [0.00, 'rgba(255,255,255,0.85)'],
+  [0.30, 'rgba(255,255,255,0.30)'],
+  [0.65, 'rgba(255,255,255,0.07)'],
+  [1.00, 'rgba(255,255,255,0)'],
+]);
+
+// ---------------- 星系几何 ----------------
+// 螺旋分布：r 幂分布让核心密集；散开程度随半径增大 -> 外臂更蓬松；y 按厚度压扁成盘
+function buildGalaxyGeometry(p, brightBoost) {
+  const n = Math.max(1, Math.round(p.count * (brightBoost ? 0.06 : 1)));
+  const pos = new Float32Array(n * 3);
+  const col = new Float32Array(n * 3);
+  const pal = PALETTES[p.palette];
+  const cIn = new THREE.Color(pal.inner);
+  const cOut = new THREE.Color(pal.outer);
+  const tmp = new THREE.Color();
+
+  for (let i = 0; i < n; i++) {
+    const r = Math.pow(Math.random(), 0.85) * p.radius;
+    const branch = ((i % p.branches) / p.branches) * Math.PI * 2;
+    const spinAngle = r * p.spin;
+    const spread = p.randomness * (0.25 + r / p.radius);
+    const jit = () => Math.pow(Math.random(), p.power) * (Math.random() < 0.5 ? 1 : -1);
+
+    pos[i * 3]     = Math.cos(branch + spinAngle) * r + jit() * spread;
+    pos[i * 3 + 1] = jit() * spread * p.thickness;
+    pos[i * 3 + 2] = Math.sin(branch + spinAngle) * r + jit() * spread;
+
+    tmp.copy(cIn).lerp(cOut, Math.min(1, r / p.radius));
+    // 亮度抖动：制造明暗层次，避免一片均匀噪点
+    const b = (0.55 + Math.random() * 0.65) * (brightBoost ? 1.6 : 1);
+    col[i * 3] = tmp.r * b; col[i * 3 + 1] = tmp.g * b; col[i * 3 + 2] = tmp.b * b;
+  }
+
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  return g;
+}
+
+function pointsMaterial(size) {
+  return new THREE.PointsMaterial({
+    size, map: starTex, vertexColors: true, transparent: true,
+    sizeAttenuation: true, depthWrite: false, blending: THREE.AdditiveBlending,
+  });
+}
+
+// 两层：微星铺量 + 巨星点睛（PointsMaterial 无法逐点改尺寸，用分层代替）
+const micro = new THREE.Points(new THREE.BufferGeometry(), pointsMaterial(0.035));
+const giant = new THREE.Points(new THREE.BufferGeometry(), pointsMaterial(0.11));
+galaxy.add(micro, giant);
+
+// 核心辉光
+const coreGlow = new THREE.Sprite(new THREE.SpriteMaterial({
+  map: coreTex, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, opacity: 0.6,
+}));
+coreGlow.scale.set(3.4, 3.4, 1);
+galaxy.add(coreGlow);
+
+// 远景星尘：慢速反向自转，制造景深
+function buildDust(n, R) {
+  const pos = new Float32Array(n * 3), col = new Float32Array(n * 3);
+  const c = new THREE.Color('#9AA8BF');
+  for (let i = 0; i < n; i++) {
+    const rr = R * (0.9 + Math.random() * 1.4);
+    const th = Math.random() * Math.PI * 2;
+    const ph = Math.acos(2 * Math.random() - 1);
+    pos[i * 3]     = rr * Math.sin(ph) * Math.cos(th);
+    pos[i * 3 + 1] = rr * Math.cos(ph) * 0.45;
+    pos[i * 3 + 2] = rr * Math.sin(ph) * Math.sin(th);
+    const b = 0.18 + Math.random() * 0.35;
+    col[i * 3] = c.r * b; col[i * 3 + 1] = c.g * b; col[i * 3 + 2] = c.b * b;
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  return g;
+}
+const dustPoints = new THREE.Points(buildDust(2200, params.radius), pointsMaterial(0.05));
+dust.add(dustPoints);
+
+function rebuild() {
+  micro.geometry.dispose();
+  giant.geometry.dispose();
+  micro.geometry = buildGalaxyGeometry(params, false);
+  giant.geometry = buildGalaxyGeometry(params, true);
+  const pal = PALETTES[params.palette];
+  coreGlow.material.color.set(pal.core);
+  document.getElementById('count').textContent =
+    (params.count + Math.round(params.count * 0.06) + 2200).toLocaleString();
+}
+rebuild();
+
+// ---------------- 交互 ----------------
+const tilt = { x: 0, z: 0 }, tiltTarget = { x: 0, z: 0 };
+if (!reduceMotion) {
+  window.addEventListener('pointermove', (e) => {
+    tiltTarget.z = -(e.clientX / window.innerWidth - 0.5) * 0.14;
+    tiltTarget.x =  (e.clientY / window.innerHeight - 0.5) * 0.11;
+  }, { passive: true });
+}
+
+window.addEventListener('resize', () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// ---------------- 主循环 ----------------
+const fpsEl = document.getElementById('fps');
+let raf = 0, last = performance.now(), frames = 0, acc = 0;
+
+function tick(now) {
+  raf = requestAnimationFrame(tick);
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+
+  if (!document.getElementById('c_pause').checked) galaxy.rotation.y += dt * params.speed;
+  dust.rotation.y -= dt * params.speed * 0.18;
+
+  tilt.x += (tiltTarget.x - tilt.x) * 0.06;
+  tilt.z += (tiltTarget.z - tilt.z) * 0.06;
+  world.rotation.set(tilt.x, 0, tilt.z);
+
+  controls.update();
+  renderer.render(scene, camera);
+
+  frames++; acc += dt;
+  if (acc >= 0.5) { fpsEl.textContent = Math.round(frames / acc); frames = 0; acc = 0; }
+}
+
+function start() { if (!raf) { last = performance.now(); raf = requestAnimationFrame(tick); } }
+function stop() { if (raf) { cancelAnimationFrame(raf); raf = 0; } }
+// 切到后台就停 RAF：不然后台标签页还在满帧烧 GPU
+document.addEventListener('visibilitychange', () => (document.hidden ? stop() : start()));
+start();
+
+// ---------------- 调参面板 ----------------
+const bind = (id, key, fmt, onChange) => {
+  const el = document.getElementById('s_' + id);
+  const out = document.getElementById('v_' + id);
+  el.value = params[key];
+  out.textContent = fmt(params[key]);
+  el.addEventListener('input', () => {
+    params[key] = parseFloat(el.value);
+    out.textContent = fmt(params[key]);
+    if (onChange) onChange();
+  });
+};
+const int = (v) => String(v);
+bind('count', 'count', int, rebuild);
+bind('branch', 'branches', int, rebuild);
+bind('spin', 'spin', (v) => v.toFixed(2), rebuild);
+bind('thick', 'thickness', (v) => v.toFixed(2), rebuild);
+bind('speed', 'speed', (v) => v.toFixed(2));
+
+document.getElementById('s_palette').addEventListener('change', (e) => {
+  params.palette = e.target.value;
+  rebuild();
+});
+document.getElementById('b_reset').addEventListener('click', () => {
+  camera.position.set(0, 3.0, 8.6);
+  controls.target.set(0, 0, 0);
+  controls.update();
+});
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'h' || e.key === 'H') document.getElementById('panel').hidden ^= 1;
+});
+</script>
+</body>
+</html>

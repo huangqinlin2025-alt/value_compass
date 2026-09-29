@@ -1,0 +1,26 @@
+# ---------- 核心编排 ----------
+langgraph>=0.6,<0.7
+typing-extensions>=4.5
+
+# ---------- 文档解析 ----------
+langchain>=0.3,<0.4
+langchain-community>=0.3,<0.4
+pypdf>=4.0
+
+# ---------- 检索底座 ----------
+chromadb>=1.5,<2
+rank-bm25>=0.2.2
+
+# ---------- 服务与界面 ----------
+fastapi>=0.110
+uvicorn>=0.27
+streamlit>=1.39,<1.40   # Python 3.9 环境上限，升级 Python 后可放开
+
+# ---------- 工程 ----------
+pytest>=7.4
+python-dotenv>=1.0
+requests>=2.31
+
+# ---------- 可选（默认不启用，按需安装）----------
+# sentence-transformers>=2.2   # EMBEDDING_PROVIDER=bge 时需要
+# torch>=2.0                   # 同上
